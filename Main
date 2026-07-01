@@ -1,0 +1,204 @@
+import argparse
+import csv
+import heapq
+import multiprocessing as mp
+import os
+import random
+import sys
+import time
+
+
+def merge(left, right):
+    result = []
+    i = j = 0
+    while i < len(left) and j < len(right):
+        if left[i] <= right[j]:
+            result.append(left[i])
+            i += 1
+        else:
+            result.append(right[j])
+            j += 1
+    result.extend(left[i:])
+    result.extend(right[j:])
+    return result
+
+
+def merge_sort_sequential(arr):
+    if len(arr) <= 1:
+        return arr
+    mid = len(arr) // 2
+    left = merge_sort_sequential(arr[:mid])
+    right = merge_sort_sequential(arr[mid:])
+    return merge(left, right)
+
+
+def worker(worker_id, chunk, segments, barrier, merge_semaphore, log_lock, verbose=True):
+    pid = os.getpid()
+
+    t0 = time.perf_counter()
+    local_sorted = merge_sort_sequential(chunk)
+    t1 = time.perf_counter()
+
+    if verbose:
+        with log_lock:
+            print(f"[Worker {worker_id:>2} | PID {pid}] ordenou {len(chunk)} itens "
+                  f"em {t1 - t0:.4f}s")
+
+    with merge_semaphore:
+        segments[worker_id] = local_sorted
+
+    barrier.wait()
+
+
+def parallel_merge_sort(data, num_workers=None, merge_slots=None, verbose=True):
+    if num_workers is None:
+        num_workers = os.cpu_count() or 4
+    if merge_slots is None:
+        merge_slots = max(1, num_workers // 2)
+
+    manager = mp.Manager()
+    segments = manager.list([None] * num_workers)
+    barrier = mp.Barrier(num_workers)
+    merge_semaphore = mp.Semaphore(merge_slots)
+    log_lock = mp.Lock()
+
+    n = len(data)
+    chunk_size = (n + num_workers - 1) // num_workers
+    chunks = [data[i:i + chunk_size] for i in range(0, n, chunk_size)]
+    while len(chunks) < num_workers:
+        chunks.append([])
+
+    processes = []
+    for i in range(num_workers):
+        p = mp.Process(
+            target=worker,
+            args=(i, chunks[i], segments, barrier, merge_semaphore, log_lock, verbose),
+        )
+        processes.append(p)
+        p.start()
+
+    for p in processes:
+        p.join()
+
+    return list(heapq.merge(*segments))
+
+
+def carregar_csv(caminho, coluna_chave):
+    try:
+        with open(caminho, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            if fieldnames is None or coluna_chave not in fieldnames:
+                sys.exit(
+                    f"Erro: a coluna '{coluna_chave}' nao existe em {caminho}. "
+                    f"Colunas disponiveis: {fieldnames}"
+                )
+            registros = []
+            for i, linha in enumerate(reader):
+                try:
+                    valor_chave = float(linha[coluna_chave])
+                except ValueError:
+                    sys.exit(
+                        f"Erro: valor invalido na coluna '{coluna_chave}', "
+                        f"linha {i + 2} do arquivo: {linha[coluna_chave]!r}"
+                    )
+                registros.append((valor_chave, i, linha))
+    except FileNotFoundError:
+        sys.exit(f"Erro: arquivo nao encontrado: {caminho}")
+    return fieldnames, registros
+
+
+def salvar_csv(caminho, fieldnames, registros_ordenados):
+    with open(caminho, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for _, _, linha in registros_ordenados:
+            writer.writerow(linha)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Merge Sort paralelo com multiprocessing, Barrier e Semaphore."
+    )
+    parser.add_argument("-n", "--size", type=int, default=500_000,
+                         help="quantidade de elementos a ordenar (padrao: 500000)")
+    parser.add_argument("-w", "--workers", type=int, default=os.cpu_count(),
+                         help="numero de processos/workers (padrao: nucleos detectados)")
+    parser.add_argument("-s", "--merge-slots", type=int, default=None,
+                         help="quantas publicacoes/merges podem ocorrer ao mesmo "
+                              "tempo, ou seja, a capacidade do semaforo "
+                              "(padrao: workers // 2)")
+    parser.add_argument("--seed", type=int, default=42,
+                         help="semente aleatoria, para resultados reproduziveis")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                         help="nao imprime o log de cada worker, so o resumo final")
+    parser.add_argument("-i", "--input", default=None,
+                         help="arquivo CSV com dados REAIS a ordenar, em vez de "
+                              "gerar numeros aleatorios")
+    parser.add_argument("-k", "--key", default="preco",
+                         help="nome da coluna numerica usada como chave de "
+                              "ordenacao quando --input e usado (padrao: preco)")
+    parser.add_argument("-o", "--output", default=None,
+                         help="arquivo CSV de saida com os dados ordenados "
+                              "(padrao: saida_ordenada.csv, so usado com --input)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    num_workers = args.workers
+
+    if args.input:
+        print(f"Lendo dados reais de: {args.input}")
+        fieldnames, registros = carregar_csv(args.input, args.key)
+        N = len(registros)
+        print(f"Registros carregados: {N} (ordenando pela coluna '{args.key}')\n")
+        data = [(valor_chave, i) for valor_chave, i, _ in registros]
+    else:
+        fieldnames = None
+        registros = None
+        N = args.size
+        random.seed(args.seed)
+        data = [random.randint(0, 10_000_000) for _ in range(N)]
+
+    print(f"Nucleos detectados: {os.cpu_count()}")
+    print(f"Workers utilizados: {num_workers}")
+    print(f"Tamanho da entrada: {N} elementos\n")
+
+    print("== Execucao SEQUENCIAL ==")
+    t0 = time.perf_counter()
+    seq_result = merge_sort_sequential(data.copy())
+    t_seq = time.perf_counter() - t0
+    print(f"Tempo sequencial: {t_seq:.4f}s\n")
+
+    print("== Execucao PARALELA (multicore) ==")
+    t0 = time.perf_counter()
+    par_result = parallel_merge_sort(
+        data.copy(),
+        num_workers=num_workers,
+        merge_slots=args.merge_slots,
+        verbose=not args.quiet,
+    )
+    t_par = time.perf_counter() - t0
+    print(f"Tempo paralelo: {t_par:.4f}s\n")
+
+    assert seq_result == par_result, "ERRO: resultados divergem!"
+    print("Verificacao: resultado paralelo == resultado sequencial (OK)")
+
+    speedup = t_seq / t_par
+    efficiency = speedup / num_workers
+    print(f"\nSpeedup:    {speedup:.2f}x")
+    print(f"Eficiencia: {efficiency * 100:.1f}%")
+
+    if args.input:
+        par_result_completo = [(valor_chave, i, registros[i][2]) for valor_chave, i in par_result]
+        caminho_saida = args.output or "saida_ordenada.csv"
+        salvar_csv(caminho_saida, fieldnames, par_result_completo)
+        print(f"\nResultado ordenado salvo em: {caminho_saida}")
+        print(f"\nAmostra (5 primeiros, ordenados por '{args.key}'):")
+        for valor_chave, _, linha in par_result_completo[:5]:
+            print(" ", linha)
+
+
+if __name__ == "__main__":
+    main()
