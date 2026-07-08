@@ -32,7 +32,7 @@ def merge_sort_sequential(arr):
     return merge(left, right)
 
 
-def worker(worker_id, chunk, segments, barrier, merge_semaphore, log_lock, verbose=True):
+def _merge_worker(worker_id, chunk, segments, barrier, merge_semaphore, log_lock, verbose=True):
     pid = os.getpid()
 
     t0 = time.perf_counter()
@@ -41,7 +41,7 @@ def worker(worker_id, chunk, segments, barrier, merge_semaphore, log_lock, verbo
 
     if verbose:
         with log_lock:
-            print(f"[Worker {worker_id:>2} | PID {pid}] ordenou {len(chunk)} itens "
+            print(f"[Merge  | Worker {worker_id:>2} | PID {pid}] ordenou {len(chunk)} itens "
                   f"em {t1 - t0:.4f}s")
 
     with merge_semaphore:
@@ -71,7 +71,7 @@ def parallel_merge_sort(data, num_workers=None, merge_slots=None, verbose=True):
     processes = []
     for i in range(num_workers):
         p = mp.Process(
-            target=worker,
+            target=_merge_worker,
             args=(i, chunks[i], segments, barrier, merge_semaphore, log_lock, verbose),
         )
         processes.append(p)
@@ -81,6 +81,79 @@ def parallel_merge_sort(data, num_workers=None, merge_slots=None, verbose=True):
         p.join()
 
     return list(heapq.merge(*segments))
+
+
+def bubble_sort_sequential(arr):
+    arr = list(arr)
+    n = len(arr)
+    for i in range(n):
+        trocou = False
+        limite = n - i - 1
+        for j in range(limite):
+            if arr[j][0] > arr[j + 1][0]:
+                arr[j], arr[j + 1] = arr[j + 1], arr[j]
+                trocou = True
+        if not trocou:
+            break
+    return arr
+
+
+def _bubble_worker(worker_id, chunk, result_queue, barrier, publish_semaphore, log_lock, verbose=True):
+    pid = os.getpid()
+
+    t0 = time.perf_counter()
+    local_sorted = bubble_sort_sequential(chunk)
+    t1 = time.perf_counter()
+
+    if verbose:
+        with log_lock:
+            print(f"[Bolha  | Worker {worker_id:>2} | PID {pid}] ordenou {len(chunk)} itens "
+                  f"em {t1 - t0:.4f}s")
+
+    with publish_semaphore:
+        result_queue.put((worker_id, local_sorted))
+
+    barrier.wait()
+
+
+def parallel_bubble_sort(data, num_workers=None, publish_slots=None, verbose=True):
+    if num_workers is None:
+        num_workers = os.cpu_count() or 4
+    if publish_slots is None:
+        publish_slots = max(1, num_workers // 2)
+
+    n = len(data)
+    if n <= 1:
+        return list(data)
+
+    result_queue = mp.Queue()
+    barrier = mp.Barrier(num_workers)
+    publish_semaphore = mp.Semaphore(publish_slots)
+    log_lock = mp.Lock()
+
+    chunk_size = (n + num_workers - 1) // num_workers
+    chunks = [data[i:i + chunk_size] for i in range(0, n, chunk_size)]
+    while len(chunks) < num_workers:
+        chunks.append([])
+
+    processes = []
+    for i in range(num_workers):
+        p = mp.Process(
+            target=_bubble_worker,
+            args=(i, chunks[i], result_queue, barrier, publish_semaphore, log_lock, verbose),
+        )
+        processes.append(p)
+        p.start()
+
+    segments = [None] * num_workers
+    for _ in range(num_workers):
+        worker_id, local_sorted = result_queue.get()
+        segments[worker_id] = local_sorted
+
+    for p in processes:
+        p.join()
+
+    return list(heapq.merge(*segments, key=lambda item: item[0]))
 
 
 def carregar_csv(caminho, coluna_chave):
@@ -116,18 +189,75 @@ def salvar_csv(caminho, fieldnames, registros_ordenados):
             writer.writerow(linha)
 
 
+def rodar_bubble(data, num_workers, bubble_size, publish_slots, seed, verbose):
+    n_total = len(data)
+    n_bolha = min(bubble_size, n_total)
+    amostra = random.Random(seed).sample(data, n_bolha) if n_bolha < n_total else list(data)
+
+    print("== BUBBLE SORT ==")
+    print(f"Amostra usada: {n_bolha} de {n_total} elementos "
+          f"(bolha e O(n^2), por isso usamos uma amostra menor que o dataset completo)\n")
+
+    t0 = time.perf_counter()
+    seq = bubble_sort_sequential(amostra)
+    t_seq = time.perf_counter() - t0
+    print(f"Tempo sequencial (bolha): {t_seq:.4f}s")
+
+    t0 = time.perf_counter()
+    par = parallel_bubble_sort(amostra, num_workers=num_workers, publish_slots=publish_slots, verbose=verbose)
+    t_par = time.perf_counter() - t0
+    print(f"Tempo paralelo (bolha):   {t_par:.4f}s")
+
+    assert seq == par, "ERRO: bolha paralela e sequencial divergem!"
+    print("Verificacao: resultado paralelo == sequencial (OK)")
+
+    speedup = t_seq / t_par if t_par > 0 else float("inf")
+    print(f"Speedup (bolha): {speedup:.2f}x\n")
+    return par
+
+
+def rodar_merge(data, num_workers, publish_slots, verbose):
+    n_total = len(data)
+    print("== MERGE SORT ==")
+    print(f"Tamanho da entrada: {n_total} elementos\n")
+
+    t0 = time.perf_counter()
+    seq = merge_sort_sequential(data.copy())
+    t_seq = time.perf_counter() - t0
+    print(f"Tempo sequencial (merge): {t_seq:.4f}s")
+
+    t0 = time.perf_counter()
+    par = parallel_merge_sort(data.copy(), num_workers=num_workers, merge_slots=publish_slots, verbose=verbose)
+    t_par = time.perf_counter() - t0
+    print(f"Tempo paralelo (merge):   {t_par:.4f}s")
+
+    assert seq == par, "ERRO: merge paralelo e sequencial divergem!"
+    print("Verificacao: resultado paralelo == sequencial (OK)")
+
+    speedup = t_seq / t_par if t_par > 0 else float("inf")
+    efficiency = speedup / num_workers
+    print(f"Speedup (merge):    {speedup:.2f}x")
+    print(f"Eficiencia (merge): {efficiency * 100:.1f}%\n")
+    return par
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Merge Sort paralelo com multiprocessing, Barrier e Semaphore."
+        description="Bubble Sort e Merge Sort paralelos com multiprocessing, "
+                     "Barrier, Semaphore, Lock e memoria compartilhada."
     )
+    parser.add_argument("-a", "--algorithm", choices=["bubble", "merge", "both"], default="both",
+                         help="qual algoritmo rodar (padrao: both, roda os dois)")
     parser.add_argument("-n", "--size", type=int, default=500_000,
                          help="quantidade de elementos a ordenar (padrao: 500000)")
     parser.add_argument("-w", "--workers", type=int, default=os.cpu_count(),
                          help="numero de processos/workers (padrao: nucleos detectados)")
-    parser.add_argument("-s", "--merge-slots", type=int, default=None,
-                         help="quantas publicacoes/merges podem ocorrer ao mesmo "
-                              "tempo, ou seja, a capacidade do semaforo "
-                              "(padrao: workers // 2)")
+    parser.add_argument("-s", "--publish-slots", type=int, default=None,
+                         help="capacidade do semaforo usado pelos workers para "
+                              "publicar o resultado (padrao: workers // 2)")
+    parser.add_argument("--bubble-size", type=int, default=20_000,
+                         help="tamanho maximo da amostra usada no bubble sort, "
+                              "que e O(n^2) (padrao: 20000)")
     parser.add_argument("--seed", type=int, default=42,
                          help="semente aleatoria, para resultados reproduziveis")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -147,6 +277,7 @@ def parse_args():
 def main():
     args = parse_args()
     num_workers = args.workers
+    verbose = not args.quiet
 
     if args.input:
         print(f"Lendo dados reais de: {args.input}")
@@ -159,44 +290,27 @@ def main():
         registros = None
         N = args.size
         random.seed(args.seed)
-        data = [random.randint(0, 10_000_000) for _ in range(N)]
+        data = [(random.randint(0, 10_000_000), i) for i in range(N)]
 
     print(f"Nucleos detectados: {os.cpu_count()}")
     print(f"Workers utilizados: {num_workers}")
-    print(f"Tamanho da entrada: {N} elementos\n")
+    print(f"Algoritmo(s): {args.algorithm}\n")
 
-    print("== Execucao SEQUENCIAL ==")
-    t0 = time.perf_counter()
-    seq_result = merge_sort_sequential(data.copy())
-    t_seq = time.perf_counter() - t0
-    print(f"Tempo sequencial: {t_seq:.4f}s\n")
+    resultado_para_salvar = None
 
-    print("== Execucao PARALELA (multicore) ==")
-    t0 = time.perf_counter()
-    par_result = parallel_merge_sort(
-        data.copy(),
-        num_workers=num_workers,
-        merge_slots=args.merge_slots,
-        verbose=not args.quiet,
-    )
-    t_par = time.perf_counter() - t0
-    print(f"Tempo paralelo: {t_par:.4f}s\n")
+    if args.algorithm in ("bubble", "both"):
+        rodar_bubble(data, num_workers, args.bubble_size, args.publish_slots, args.seed, verbose)
 
-    assert seq_result == par_result, "ERRO: resultados divergem!"
-    print("Verificacao: resultado paralelo == resultado sequencial (OK)")
+    if args.algorithm in ("merge", "both"):
+        resultado_para_salvar = rodar_merge(data, num_workers, args.publish_slots, verbose)
 
-    speedup = t_seq / t_par
-    efficiency = speedup / num_workers
-    print(f"\nSpeedup:    {speedup:.2f}x")
-    print(f"Eficiencia: {efficiency * 100:.1f}%")
-
-    if args.input:
-        par_result_completo = [(valor_chave, i, registros[i][2]) for valor_chave, i in par_result]
+    if args.input and resultado_para_salvar is not None:
+        par_result_completo = [(valor_chave, i, registros[i][2]) for valor_chave, i in resultado_para_salvar]
         caminho_saida = args.output or "saida_ordenada.csv"
         salvar_csv(caminho_saida, fieldnames, par_result_completo)
-        print(f"\nResultado ordenado salvo em: {caminho_saida}")
+        print(f"Resultado ordenado (merge) salvo em: {caminho_saida}")
         print(f"\nAmostra (5 primeiros, ordenados por '{args.key}'):")
-        for valor_chave, _, linha in par_result_completo[:5]:
+        for _, _, linha in par_result_completo[:5]:
             print(" ", linha)
 
 
